@@ -521,7 +521,8 @@ def make_optimizer(model, recipe, optimizer='adam', muon_lr=0.01, muon_momentum=
             # Mutate a tensor LR during warmdown instead of specializing a graph per Python float.
             group['lr'] = torch.tensor(group['lr'])
         if compile_step:
-            opt.step = torch.compile(opt.step)
+            # Preserve BF16 rounding between Newton–Schulz operations when fusing kernels.
+            opt.step = torch.compile(opt.step, options={'emulate_precision_casts': True})
     return adam if optimizer == 'adam' else HybridOptimizer(*optimizers)
 
 
