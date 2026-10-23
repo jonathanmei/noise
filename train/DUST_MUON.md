@@ -59,8 +59,9 @@ These runs test whether Muon can close that gap; reaching 3.5 is not assumed.
 ## Obsidian
 
 `objob.toml` requests 8 H100s on `cgpus` for four hours. The initial comparison
-uses 1,000 updates per optimizer (the recorded 1,831-update run exceeds this
-partition's time limit). Data lives in `/home/jonathan.mei/data/noise`.
+uses 400 updates per optimizer: the four-GPU smoke test took roughly 45–60
+seconds per update, so even with ideal scaling, 1,000 updates on eight GPUs
+would exceed the partition limit. Data lives in `/home/jonathan.mei/data/noise`.
 Submit each optimizer separately so each has its own four-hour allocation.
 Both runs measure final loss and time to the first observed target crossing.
 
@@ -68,9 +69,9 @@ Both runs measure final loss and time to the first observed target crossing.
 objob submit --partition cpus --gres '' --cpus 8 --mem 32G --job-name noise-data -- \
   uv run utils/prepare_data.py --output /home/jonathan.mei/data/noise
 # Once data preparation and the two-step GPU smoke test succeed:
-objob submit --job-name dust-muon-1000
-objob submit --job-name dust-adam-1000 -- \
+objob submit --job-name dust-muon-compiled-400
+objob submit --job-name dust-adam-compiled-400 -- \
   uv run torchrun --standalone --nproc_per_node=8 train/val/dust.py \
-  --optimizer adam --steps 1000 --eval-every 100 --target-loss 3.5 \
-  --data-dir /home/jonathan.mei/data/noise --output logs/obsidian-adam-1000
+  --optimizer adam --steps 400 --eval-every 100 --target-loss 3.5 \
+  --data-dir /home/jonathan.mei/data/noise --output logs/obsidian-adam-compiled-400
 ```

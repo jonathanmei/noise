@@ -10,7 +10,7 @@ per_branch = true    # each branch runs in its own git worktree at <dir>@<branch
 
 [slurm]
 # Command the job runs, from the project root on the cluster.
-command = "uv run torchrun --standalone --nproc_per_node=8 train/val/dust.py --optimizer muon --steps 1000 --eval-every 100 --target-loss 3.5 --data-dir /home/jonathan.mei/data/noise --output logs/obsidian-muon-1000"
+command = "uv run torchrun --standalone --nproc_per_node=8 train/val/dust.py --optimizer muon --steps 400 --eval-every 100 --target-loss 3.5 --data-dir /home/jonathan.mei/data/noise --output logs/obsidian-muon-compiled-400"
 partition = "cgpus"   # short (30 min) | cpus / gpus / cgpus (4 h) | notebooks
 time = "04:00:00"     # walltime; must fit the partition limit
 cpus_per_task = 32
