@@ -495,7 +495,8 @@ class HybridOptimizer:
             optimizer.step()
 
 
-def make_optimizer(model, recipe, optimizer='adam', muon_lr=0.01, muon_momentum=0.95, muon_ns_steps=5):
+def make_optimizer(model, recipe, optimizer='adam', muon_lr=0.01, muon_momentum=0.95, muon_ns_steps=5,
+                   compile_step=True):
     """Muon on block projections; Adam on the head, embeddings, gates and mixing scalars."""
     groups = {}
     matrices = []
@@ -509,11 +510,26 @@ def make_optimizer(model, recipe, optimizer='adam', muon_lr=0.01, muon_momentum=
         [{'params': ps, 'lr': recipe.lr * scale} for scale, ps in groups.items()],
         betas=recipe.betas, eps=1e-8, weight_decay=0.0,
     )
-    if optimizer == 'adam':
-        return adam
-    muon = torch.optim.Muon(matrices, lr=muon_lr, momentum=muon_momentum, ns_steps=muon_ns_steps,
-                            nesterov=True, weight_decay=0.0, adjust_lr_fn='original')
-    return HybridOptimizer(muon, adam)
+    optimizers = [adam]
+    if optimizer == 'muon':
+        muon = torch.optim.Muon(matrices, lr=muon_lr, momentum=muon_momentum, ns_steps=muon_ns_steps,
+                                nesterov=True, weight_decay=0.0, adjust_lr_fn='original')
+        optimizers.insert(0, muon)
+    for opt in optimizers:
+        for group in opt.param_groups:
+            group['initial_lr'] = group['lr']
+            # Mutate a tensor LR during warmdown instead of specializing a graph per Python float.
+            group['lr'] = torch.tensor(group['lr'])
+        if compile_step:
+            opt.step = torch.compile(opt.step)
+    return adam if optimizer == 'adam' else HybridOptimizer(*optimizers)
+
+
+def set_rate(optimizer, step, steps, warmdown):
+    left = (steps - step + 1) / steps
+    factor = min(1.0, left / warmdown if warmdown else 1.0)
+    for group in optimizer.param_groups:
+        group['lr'].fill_(group['initial_lr'] * factor)
 
 
 def main():
@@ -524,6 +540,7 @@ def main():
     parser.add_argument('--warmdown', type=float, help='Override the recipe\'s warmdown fraction.')
     parser.add_argument('--lr', type=float, help='Override the recipe\'s Adam learning rate.')
     parser.add_argument('--optimizer', choices=('adam', 'muon'), default='adam')
+    parser.add_argument('--eager-optimizer', action='store_true', help='Disable optimizer-step compilation.')
     parser.add_argument('--muon-lr', type=float, default=0.01)
     parser.add_argument('--muon-momentum', type=float, default=0.95)
     parser.add_argument('--muon-ns-steps', type=int, default=5)
@@ -567,6 +584,7 @@ def main():
             script=__file__, world=world, batch=BATCH, steps=steps, seed=SEED,
             recipe=asdict(settings), torch_version=torch.__version__,
             optimizer=args.optimizer, muon_lr=args.muon_lr, muon_momentum=args.muon_momentum,
+            compile_optimizer=not args.eager_optimizer,
             muon_ns_steps=args.muon_ns_steps, muon_adjust_lr_fn='original',
             target_loss=args.target_loss, stop_at_target=args.stop_at_target, eval_every=args.eval_every,
         ), indent=2) + '\n')
@@ -574,20 +592,16 @@ def main():
     def init():
         model = make_model(device, SEED)
         optimizer = make_optimizer(model, settings, args.optimizer, args.muon_lr,
-                                   args.muon_momentum, args.muon_ns_steps)
+                                   args.muon_momentum, args.muon_ns_steps, not args.eager_optimizer)
         return model, optimizer, DUST(model, settings, SEED, rank, world)
-
-    def set_rate(optimizer, step):
-        left = (steps - step + 1) / steps  # fraction of the epoch still ahead, this update included
-        for group in optimizer.param_groups:
-            group.setdefault('initial_lr', group['lr'])
-            group['lr'] = group['initial_lr'] * min(1.0, left / settings.warmdown if settings.warmdown else 1.0)
 
     # Untimed warmup on random tokens loads kernels and sets up communication. Everything is then rebuilt
     # from the seed, so the timed run starts exactly as if the warmup never happened.
     model, optimizer, estimator = init()
     noise = torch.randint(0, 4096, (BATCH, 2049), generator=torch.Generator().manual_seed(SEED)).to(device)
     estimator.step(noise[:, :-1].contiguous(), noise[:, 1:].contiguous(), optimizer)
+    # Compile the initialized-state path too, without spending another Dust population.
+    optimizer.step()
     estimator.close()
     model, optimizer, estimator = init()
 
@@ -600,7 +614,7 @@ def main():
     val_loss = None
     for step in range(1, steps + 1):
         batch = training[(step - 1) * BATCH:step * BATCH].to(device)
-        set_rate(optimizer, step)
+        set_rate(optimizer, step, steps, settings.warmdown)
         loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start - paused

@@ -21,6 +21,12 @@ Muon uses the block attention/MLP projections, momentum 0.95, Nesterov,
 five Newton–Schulz iterations, original aspect-ratio LR scaling, LR 0.01,
 and zero weight decay. Adam retains the existing rates for embeddings, head,
 gates and mixing scalars. Gradients are averaged across ranks before momentum.
+Both optimizers' steps use `torch.compile` by default. Tensor learning rates
+allow warmdown without specializing a new graph per rate. Untimed warmup covers
+both fresh and initialized optimizer state, then rebuilds training from seed 0.
+Use `--eager-optimizer` on `dust.py` for an eager comparison. Check compiled/eager
+updates and schedule recompilation with
+`uv run train/check_dust_optimizer.py --device cuda`.
 
 For a smoke run or an LR sweep:
 
