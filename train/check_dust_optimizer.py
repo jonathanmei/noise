@@ -58,7 +58,8 @@ def main():
             for a_group, b_group in zip(a_opt.param_groups, b_opt.param_groups):
                 for a, b in zip(a_group['params'], b_group['params']):
                     for key, value in a_opt.state[a].items():
-                        torch.testing.assert_close(value, b_opt.state[b][key], rtol=2e-3, atol=2e-4)
+                        # Compiled Adam keeps its step counter on device; eager Adam uses the CPU.
+                        torch.testing.assert_close(value.cpu(), b_opt.state[b][key].cpu(), rtol=2e-3, atol=2e-4)
         print(f'{kind}: compiled/eager parameters and state match; changing LR does not recompile', flush=True)
 
 
