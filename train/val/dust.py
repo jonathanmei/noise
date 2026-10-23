@@ -13,7 +13,7 @@ One update (DUST.step):
   4. The head is jittered on the cached logits, one 256-column slab at a time.
   5. The outer product of each layer's estimated output error with its cached input, summed over
      tokens, is the layer's weight gradient, as in backprop. The 2L residual mixing scalars use
-     two-sided weight-space ES. Then one Adam step.
+     two-sided weight-space ES. Then one Adam or hybrid Muon/Adam step.
 
 Launch: torchrun --standalone --nproc_per_node=8 train/val/dust.py
 """
@@ -413,7 +413,7 @@ class DUST:
 
     @torch.no_grad()
     def step(self, x, y, optimizer):
-        """One clean pass, direct-loss estimates, local attention estimates, then an Adam update."""
+        """One clean pass, direct-loss estimates, local attention estimates, then an optimizer update."""
         self.capture(x, y)
         r, world, layers = self.recipe, self.world, self.model.config.n_layer
         gradients = {}
@@ -479,16 +479,41 @@ def make_model(device, seed):
     return model.requires_grad_(False)
 
 
-def make_optimizer(model, recipe):
-    """Adam at three rates: matrices and the head, embeddings (300x), residual mixing scalars (30x)."""
+class HybridOptimizer:
+    """Expose both optimizers' groups to the shared learning-rate schedule."""
+
+    def __init__(self, *optimizers):
+        self.optimizers = optimizers
+        self.param_groups = [group for optimizer in optimizers for group in optimizer.param_groups]
+
+    def zero_grad(self, set_to_none=True):
+        for optimizer in self.optimizers:
+            optimizer.zero_grad(set_to_none=set_to_none)
+
+    def step(self):
+        for optimizer in self.optimizers:
+            optimizer.step()
+
+
+def make_optimizer(model, recipe, optimizer='adam', muon_lr=0.01, muon_momentum=0.95, muon_ns_steps=5):
+    """Muon on block projections; Adam on the head, embeddings, gates and mixing scalars."""
     groups = {}
+    matrices = []
     for name, parameter in model.named_parameters():
+        if optimizer == 'muon' and name.startswith('transformer.h.') and parameter.ndim == 2 and 've_gate' not in name:
+            matrices.append(parameter)
+            continue
         scale = 300 if ('wte' in name or 'value_embeds' in name) else 30 if 'lambdas' in name else 1
         groups.setdefault(scale, []).append(parameter)
-    return torch.optim.AdamW(
+    adam = torch.optim.AdamW(
         [{'params': ps, 'lr': recipe.lr * scale} for scale, ps in groups.items()],
         betas=recipe.betas, eps=1e-8, weight_decay=0.0,
     )
+    if optimizer == 'adam':
+        return adam
+    muon = torch.optim.Muon(matrices, lr=muon_lr, momentum=muon_momentum, ns_steps=muon_ns_steps,
+                            nesterov=True, weight_decay=0.0, adjust_lr_fn='original')
+    return HybridOptimizer(muon, adam)
 
 
 def main():
@@ -498,9 +523,23 @@ def main():
     parser.add_argument('--scale', type=float, help='Scale every draw count of the 16k Adam cell instead.')
     parser.add_argument('--warmdown', type=float, help='Override the recipe\'s warmdown fraction.')
     parser.add_argument('--lr', type=float, help='Override the recipe\'s Adam learning rate.')
+    parser.add_argument('--optimizer', choices=('adam', 'muon'), default='adam')
+    parser.add_argument('--muon-lr', type=float, default=0.01)
+    parser.add_argument('--muon-momentum', type=float, default=0.95)
+    parser.add_argument('--muon-ns-steps', type=int, default=5)
+    parser.add_argument('--target-loss', type=float, help='Record the first validation at or below this loss.')
+    parser.add_argument('--stop-at-target', action='store_true', help='End the speedrun at the first target hit.')
     parser.add_argument('--steps', type=int, help='Stop after this many updates (smoke tests).')
     parser.add_argument('--eval-every', type=int, default=0, help='Untimed validation every this many updates.')
     args = parser.parse_args()
+    if args.steps is not None and args.steps <= 0:
+        parser.error('--steps must be positive.')
+    if args.eval_every < 0 or (args.target_loss is not None and args.eval_every <= 0):
+        parser.error('Target tracking requires --eval-every > 0.')
+    if args.stop_at_target and args.target_loss is None:
+        parser.error('--stop-at-target requires --target-loss.')
+    if not 0 <= args.muon_momentum < 1 or not 1 <= args.muon_ns_steps < 100 or args.muon_lr <= 0:
+        parser.error('Muon requires positive lr, momentum in [0, 1), and 1–99 NS steps.')
 
     if not torch.cuda.is_available():
         parser.error('Training requires a CUDA GPU.')
@@ -527,11 +566,16 @@ def main():
         (args.output / 'config.json').write_text(json.dumps(dict(
             script=__file__, world=world, batch=BATCH, steps=steps, seed=SEED,
             recipe=asdict(settings), torch_version=torch.__version__,
+            optimizer=args.optimizer, muon_lr=args.muon_lr, muon_momentum=args.muon_momentum,
+            muon_ns_steps=args.muon_ns_steps, muon_adjust_lr_fn='original',
+            target_loss=args.target_loss, stop_at_target=args.stop_at_target, eval_every=args.eval_every,
         ), indent=2) + '\n')
 
     def init():
         model = make_model(device, SEED)
-        return model, make_optimizer(model, settings), DUST(model, settings, SEED, rank, world)
+        optimizer = make_optimizer(model, settings, args.optimizer, args.muon_lr,
+                                   args.muon_momentum, args.muon_ns_steps)
+        return model, optimizer, DUST(model, settings, SEED, rank, world)
 
     def set_rate(optimizer, step):
         left = (steps - step + 1) / steps  # fraction of the epoch still ahead, this update included
@@ -552,6 +596,8 @@ def main():
     log = (args.output / 'metrics.jsonl').open('a') if rank == 0 else None
     torch.cuda.synchronize()
     start, paused, elapsed = time.perf_counter(), 0.0, 0.0
+    target_hit = None
+    val_loss = None
     for step in range(1, steps + 1):
         batch = training[(step - 1) * BATCH:step * BATCH].to(device)
         set_rate(optimizer, step)
@@ -559,21 +605,32 @@ def main():
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start - paused
         record = dict(step=step, train_loss=loss, train_seconds=round(elapsed, 2))
-        if args.eval_every and step % args.eval_every == 0 and step < steps:
+        val_loss = None
+        if args.eval_every and (step % args.eval_every == 0 or step == steps):
             pause = time.perf_counter()
-            record['val_loss'] = evaluate(model.state_dict(), args.data_dir)
+            val_loss = record['val_loss'] = evaluate(model.state_dict(), args.data_dir)
+            torch.cuda.synchronize()
+            if world > 1:
+                torch.distributed.barrier()
             paused += time.perf_counter() - pause
+            if args.target_loss is not None and val_loss <= args.target_loss and target_hit is None:
+                target_hit = dict(step=step, train_seconds=round(elapsed, 2), val_loss=val_loss)
+                record['target_hit'] = target_hit
         if rank == 0:
             print(json.dumps(record), flush=True)
             log.write(json.dumps(record) + '\n')
+            log.flush()
+        if args.stop_at_target and target_hit is not None:
+            break
 
     estimator.close()
     state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-    val_loss = evaluate(state, args.data_dir)
+    if val_loss is None:
+        val_loss = evaluate(state, args.data_dir)
     if rank == 0:
         torch.save(state, args.output / 'final.pt')
         result = dict(val_loss=val_loss, train_seconds=round(elapsed, 2), steps=step,
-                      tokens=step * BATCH * 2048)
+                       tokens=step * BATCH * 2048, target_loss=args.target_loss, target_hit=target_hit)
         (args.output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         print(json.dumps(result), flush=True)
     if world > 1:
